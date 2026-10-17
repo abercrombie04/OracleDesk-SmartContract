@@ -1,5 +1,8 @@
 #![no_std]
 
+#[cfg(test)]
+extern crate std;
+
 mod math;
 
 use math::{MathError, Settlement, BPS, MAX_SETS};
@@ -21,6 +24,25 @@ const BUMP_TO: u32 = 60 * DAY_IN_LEDGERS;
 const MAX_FEE_BPS: u32 = 1_000;
 /// Minimum seed liquidity: 100 USDC (7 decimals). Stops spam markets.
 const MIN_SEED: i128 = 100 * 10_000_000;
+/// Longest accepted `meta_uri`, in bytes (`soroban_sdk::String::len()` counts
+/// bytes, not characters).
+///
+/// A `Market` is one persistent entry (`DataKey::Market(u64)`) that is read and
+/// rewritten by every `buy`, `sell`, `resolve`, `redeem`,
+/// `claim_pool_remainder` and `sweep_fees`, so these 256 bytes are paid again on
+/// every later trade. 256 leaves the realistic formats enormous headroom:
+/// `ipfs://` + a base32 CIDv1 is ~66 bytes, and an `https://` gateway URL with a
+/// CID path fits in well under 100. That is ~4x the worst realistic case, which
+/// is enough slack that no legitimate market creation is refused while the
+/// `Market` entry's variable part stays bounded.
+///
+/// Deliberately *no* charset restriction here, unlike reasoning-registry's
+/// `action`/`ipfs_cid`: a metadata URI is an opaque locator whose legal forms
+/// (percent-escaped paths, `ipns://`, unicode hostnames) are too varied to
+/// enumerate, and it is never hashed or signed, so only its size matters to the
+/// ledger. The asymmetry is intentional; see the input-limits table in
+/// `docs/architecture.md`.
+pub const MAX_META_URI_BYTES: u32 = 256;
 
 // ---------------------------------------------------------------------------
 // Types shared with the frontend/backend
@@ -208,6 +230,10 @@ pub enum Error {
     PriceImpactTooHigh = 21,
     /// Cumulative same-ledger movement would exceed `band_bps`.
     PriceBandExceeded = 22,
+    /// `create_market` got a `meta_uri` longer than `MAX_META_URI_BYTES`.
+    /// Appended at the end of the enum: codes are part of the bindings/backend
+    /// contract and are never renumbered (issue #17).
+    MetaUriTooLong = 23,
 }
 
 impl From<MathError> for Error {
@@ -471,6 +497,14 @@ impl MarketCore {
         seed_amount: i128,
         initial_yes_bps: u32,
     ) -> Result<u64, Error> {
+        // Sized before anything else, including the storage read in
+        // `assert_not_paused`: `meta_uri` is stored inside `Market` and rewritten
+        // on every later trade, so the bound has to be enforced before this call
+        // touches the ledger at all. It is a pure byte-length check on caller
+        // data, so running it ahead of `require_auth` leaks nothing.
+        if meta_uri.len() > MAX_META_URI_BYTES {
+            return Err(Error::MetaUriTooLong);
+        }
         Self::assert_not_paused(&env)?;
         creator.require_auth();
 
@@ -2728,5 +2762,289 @@ mod test {
         client.void_market(&market_id);
         client.claim_pool_remainder(&market_id);
         client.transfer_lp(&market_id, &Address::generate(&env));
+    }
+}
+
+/// Input-bound and worst-case-budget proofs for `create_market`'s `meta_uri`,
+/// the only caller-controlled unbounded-length input this contract stores.
+///
+/// The budget figures are recorded for a *native* (Rust) registration of
+/// `MarketCore`, which the SDK documents as an underestimate of the same call
+/// running as wasm; the ceilings therefore lean on the network's own margin
+/// (mainnet per-transaction limits, `InvocationResourceLimits::mainnet()`: 400M
+/// instructions, 41,943,040 memory bytes, 132,096 ledger write bytes). See the
+/// input-limits table in `docs/architecture.md`.
+#[cfg(test)]
+mod limits {
+    use super::*;
+    use soroban_sdk::{testutils::Address as _, token::StellarAssetClient};
+
+    /// Ceilings for `create_market` whose `meta_uri` is exactly at
+    /// `MAX_META_URI_BYTES`. Measured (native) worst case is 398,917
+    /// instructions / 60,120 memory bytes / 2,176 ledger write bytes, so these
+    /// are ~2.5x that and ~0.25% / 0.36% / 1.7% of the network's
+    /// per-transaction limits. Recorded in `docs/architecture.md`; the same call
+    /// measured against the compiled `market_core.wasm` is in
+    /// `resolver`'s `limits` module (`worst_case_create_market_on_wasm...`).
+    const CEIL_CREATE_MARKET_CPU: u64 = 1_000_000;
+    const CEIL_CREATE_MARKET_MEM: u64 = 150_000;
+    const CEIL_CREATE_MARKET_WRITE_BYTES: u32 = 3_000;
+    /// The `budget()` tracker counts host-side overhead that the per-invocation
+    /// `resources()` delta does not, so it reads higher for the same call. It is
+    /// asserted separately, at ~2.5x its own measurement.
+    const CEIL_CREATE_MARKET_TRACKER_CPU: u64 = 1_500_000;
+    const CEIL_CREATE_MARKET_TRACKER_MEM: u64 = 500_000;
+    /// Ceilings for `buy` on such a market. This is the case the bound exists
+    /// for: `Market` (uri included) is read and rewritten on every trade, so an
+    /// unbounded uri made *every later* trade more expensive. Measured: 438,537
+    /// instructions / 63,133 memory bytes / 1,632 write bytes.
+    const CEIL_BUY_CPU: u64 = 1_000_000;
+    const CEIL_BUY_MEM: u64 = 150_000;
+    const CEIL_BUY_WRITE_BYTES: u32 = 3_000;
+    const CEIL_BUY_TRACKER_CPU: u64 = 1_500_000;
+    const CEIL_BUY_TRACKER_MEM: u64 = 500_000;
+
+    struct Fixture {
+        env: Env,
+        client: MarketCoreClient<'static>,
+        creator: Address,
+        trader: Address,
+    }
+
+    /// Mirrors `test::setup_market`, kept self-contained so the resource proofs
+    /// do not depend on the behavioural suite's helpers.
+    fn fixture() -> Fixture {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let resolver = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let trader = Address::generate(&env);
+
+        let collateral = env.register_stellar_asset_contract_v2(admin.clone());
+        let stellar = StellarAssetClient::new(&env, &collateral.address());
+        stellar.mint(&creator, &10_000_000_000_i128);
+        stellar.mint(&trader, &10_000_000_000_i128);
+
+        let contract_id = env.register(
+            MarketCore,
+            MarketCoreArgs::__constructor(
+                &admin,
+                &collateral.address(),
+                &treasury,
+                &resolver,
+                &100u32,
+                &10_000u32,
+            ),
+        );
+        let client = MarketCoreClient::new(&env, &contract_id);
+        Fixture {
+            env,
+            client,
+            creator,
+            trader,
+        }
+    }
+
+    /// A `meta_uri` of exactly `len` bytes: an `ipfs://` scheme prefix and a
+    /// padded opaque path, i.e. the shape a real gateway URI has.
+    fn uri_of_len(env: &Env, len: usize) -> String {
+        let mut raw: std::string::String = "ipfs://".into();
+        while raw.len() < len {
+            raw.push('x');
+        }
+        String::from_str(env, &raw)
+    }
+
+    /// The full argument list every limit test shares, at the smallest legal
+    /// seed and a 50/50 opening price.
+    fn create(f: &Fixture, meta_uri: &String) -> u64 {
+        f.client.create_market(
+            &f.creator,
+            &BytesN::from_array(&f.env, &[1u8; 32]),
+            &BytesN::from_array(&f.env, &[101u8; 32]),
+            meta_uri,
+            &Category::Crypto,
+            &(f.env.ledger().timestamp() + 60_000),
+            &(100 * 10_000_000_i128),
+            &5000u32,
+        )
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #23)")]
+    fn create_market_rejects_meta_uri_over_limit() {
+        let f = fixture();
+        let over = uri_of_len(&f.env, MAX_META_URI_BYTES as usize + 1);
+        assert_eq!(over.len(), MAX_META_URI_BYTES + 1);
+        create(&f, &over);
+    }
+
+    #[test]
+    fn over_limit_meta_uri_is_rejected_without_writing() {
+        let f = fixture();
+        for len in [MAX_META_URI_BYTES as usize + 1, 1_000, 65_536, 100_000] {
+            assert!(
+                f.client
+                    .try_create_market(
+                        &f.creator,
+                        &BytesN::from_array(&f.env, &[1u8; 32]),
+                        &BytesN::from_array(&f.env, &[101u8; 32]),
+                        &uri_of_len(&f.env, len),
+                        &Category::Crypto,
+                        &(f.env.ledger().timestamp() + 60_000),
+                        &(100 * 10_000_000_i128),
+                        &5000u32,
+                    )
+                    .is_err(),
+                "a {len}-byte meta_uri must be rejected"
+            );
+        }
+        // Nothing was stored: the check runs before any ledger access.
+        assert_eq!(f.client.market_count(), 0);
+    }
+
+    #[test]
+    fn create_market_accepts_meta_uri_at_limit() {
+        let f = fixture();
+        let at_limit = uri_of_len(&f.env, MAX_META_URI_BYTES as usize);
+        assert_eq!(at_limit.len(), MAX_META_URI_BYTES);
+        let id = create(&f, &at_limit);
+        assert_eq!(id, 0);
+        assert_eq!(f.client.get_market(&id).meta_uri, at_limit);
+        // The formats this bound is sized for stay far inside it.
+        for sample in [
+            "ipfs://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+            "https://ipfs.io/ipfs/bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+        ] {
+            let uri = String::from_str(&f.env, sample);
+            assert!(uri.len() < 100, "sample unexpectedly long: {sample}");
+            assert!(f
+                .client
+                .try_create_market(
+                    &f.creator,
+                    &BytesN::from_array(&f.env, &[2u8; 32]),
+                    &BytesN::from_array(&f.env, &[102u8; 32]),
+                    &uri,
+                    &Category::Crypto,
+                    &(f.env.ledger().timestamp() + 60_000),
+                    &(100 * 10_000_000_i128),
+                    &5000u32,
+                )
+                .is_ok());
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #2)")]
+    fn meta_uri_bound_does_not_displace_the_pause_error() {
+        // Precedence is part of the contract: an in-bounds uri on a paused
+        // contract still reports `Paused`, because the length check only rejects
+        // input that is actually too long.
+        let f = fixture();
+        f.client.set_paused(&true);
+        create(
+            &f,
+            &String::from_str(&f.env, "ipfs://a-legal-uri-on-a-paused-instance"),
+        );
+    }
+
+    #[test]
+    fn worst_case_buy_with_max_meta_uri_fits_budget() {
+        let f = fixture();
+        let market_id = create(&f, &uri_of_len(&f.env, MAX_META_URI_BYTES as usize));
+
+        let mut budget = f.env.cost_estimate().budget();
+        budget.reset_unlimited();
+        f.client
+            .buy(&f.trader, &market_id, &Outcome::Yes, &1_000_000, &0);
+        let resources = f.env.cost_estimate().resources();
+        std::println!(
+            "buy @max meta_uri: {} instr, {} mem bytes, {} write bytes, {} write entries, {} event bytes",
+            resources.instructions,
+            resources.mem_bytes,
+            resources.write_bytes,
+            resources.write_entries,
+            resources.contract_events_size_bytes
+        );
+        assert!(
+            resources.instructions <= CEIL_BUY_CPU as i64,
+            "buy used {} instructions, ceiling {CEIL_BUY_CPU}",
+            resources.instructions
+        );
+        assert!(
+            resources.mem_bytes <= CEIL_BUY_MEM as i64,
+            "buy used {} memory bytes, ceiling {CEIL_BUY_MEM}",
+            resources.mem_bytes
+        );
+        assert!(
+            resources.write_bytes <= CEIL_BUY_WRITE_BYTES,
+            "buy wrote {} ledger bytes, ceiling {CEIL_BUY_WRITE_BYTES}",
+            resources.write_bytes
+        );
+        // `budget()` sees the same CPU/memory from the other side.
+        let budget = f.env.cost_estimate().budget();
+        std::println!(
+            "buy @max meta_uri (budget tracker): {} instr, {} mem bytes",
+            budget.cpu_instruction_cost(),
+            budget.memory_bytes_cost()
+        );
+        assert!(budget.cpu_instruction_cost() <= CEIL_BUY_TRACKER_CPU);
+        assert!(budget.memory_bytes_cost() <= CEIL_BUY_TRACKER_MEM);
+    }
+
+    #[test]
+    fn worst_case_create_market_with_max_meta_uri_fits_budget() {
+        let f = fixture();
+        let at_limit = uri_of_len(&f.env, MAX_META_URI_BYTES as usize);
+
+        let mut budget = f.env.cost_estimate().budget();
+        budget.reset_unlimited();
+        assert!(f
+            .client
+            .try_create_market(
+                &f.creator,
+                &BytesN::from_array(&f.env, &[3u8; 32]),
+                &BytesN::from_array(&f.env, &[103u8; 32]),
+                &at_limit,
+                &Category::Crypto,
+                &(f.env.ledger().timestamp() + 60_000),
+                &(100 * 10_000_000_i128),
+                &5000u32,
+            )
+            .is_ok());
+        let resources = f.env.cost_estimate().resources();
+        std::println!(
+            "create_market @max meta_uri: {} instr, {} mem bytes, {} write bytes, {} write entries, {} event bytes",
+            resources.instructions,
+            resources.mem_bytes,
+            resources.write_bytes,
+            resources.write_entries,
+            resources.contract_events_size_bytes
+        );
+        assert!(
+            resources.instructions <= CEIL_CREATE_MARKET_CPU as i64,
+            "create_market used {} instructions, ceiling {CEIL_CREATE_MARKET_CPU}",
+            resources.instructions
+        );
+        assert!(
+            resources.mem_bytes <= CEIL_CREATE_MARKET_MEM as i64,
+            "create_market used {} memory bytes, ceiling {CEIL_CREATE_MARKET_MEM}",
+            resources.mem_bytes
+        );
+        assert!(
+            resources.write_bytes <= CEIL_CREATE_MARKET_WRITE_BYTES,
+            "create_market wrote {} ledger bytes, ceiling {CEIL_CREATE_MARKET_WRITE_BYTES}",
+            resources.write_bytes
+        );
+        let budget = f.env.cost_estimate().budget();
+        std::println!(
+            "create_market @max meta_uri (budget tracker): {} instr, {} mem bytes",
+            budget.cpu_instruction_cost(),
+            budget.memory_bytes_cost()
+        );
+        assert!(budget.cpu_instruction_cost() <= CEIL_CREATE_MARKET_TRACKER_CPU);
+        assert!(budget.memory_bytes_cost() <= CEIL_CREATE_MARKET_TRACKER_MEM);
     }
 }
